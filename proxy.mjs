@@ -1545,7 +1545,26 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
       return { ok: false, errorRes: upstreamRes };
     }
 
-    const ccResponse = await upstreamRes.json();
+    // Some providers return SSE even when stream=false — detect and accumulate.
+    const upstreamContentType = upstreamRes.headers.get("content-type") || "";
+    let ccResponse;
+    if (upstreamContentType.includes("text/event-stream")) {
+      let buffer = "";
+      const decoder = new TextDecoder();
+      for await (const chunk of upstreamRes.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+      }
+      const sseChunks = [];
+      for (const line of buffer.split("\n")) {
+        if (line.startsWith("data: ") && line !== "data: [DONE]") {
+          try { sseChunks.push(JSON.parse(line.slice(6))); } catch {}
+        }
+      }
+      ccResponse = mergeStreamedChunks(sseChunks);
+    } else {
+      ccResponse = await upstreamRes.json();
+    }
+
     const msg = ccResponse.choices?.[0]?.message;
     const webFetchCalls = (msg?.tool_calls || []).filter((tc) => tc.function?.name === "web_fetch");
     const currentFetchUrls = webFetchCalls.map((tc) => {
@@ -1638,7 +1657,16 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
   }
 
   const chatReq = responsesRequestToChatCompletions(body, provider);
-  // Pass through the model name as-is — Codex decides which model to use.
+  // Remap model to the provider's default when the requested model is not
+  // available on this upstream — e.g. OpenAI-style names like gpt-/o1/o3/o4
+  // that non-OpenAI providers don't recognize. If the upstream actually
+  // supports the model (e.g. a third-party proxy that carries gpt-4o), skip remap.
+  const upstreamModels = cfg.models || [];
+  if (!upstreamModels.includes(chatReq.model) && chatReq.model && cfg.defaultModel) {
+    const oldModel = chatReq.model;
+    chatReq.model = cfg.defaultModel;
+    log.info(`[proxy] remapped model ${oldModel} -> ${chatReq.model} for provider ${provider}`);
+  }
   const isStream = chatReq.stream;
 
   const upstreamUrl = `${cfg.base}/chat/completions`;
@@ -1694,21 +1722,63 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     return;
   }
 
+  const body2 = JSON.stringify(chatReq);
+  log.info(`[proxy] sending to ${upstreamUrl}: model=${chatReq.model} messages=${chatReq.messages.length} stream=${chatReq.stream}`);
   const upstreamRes = await fetchWithTimeout(upstreamUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${upstreamKey}`,
     },
-    body: JSON.stringify(chatReq),
+    body: body2,
   });
 
   if (!upstreamRes.ok) {
+    const errText = await upstreamRes.text().catch(() => "<no body>");
+    log.error(`[proxy] upstream ${upstreamUrl} returned ${upstreamRes.status}: ${errText.slice(0, 1000)}`);
     await sendUpstreamError(upstreamRes, res);
     return;
   }
 
-  if (isStream) {
+  // Determine if upstream returned SSE or plain JSON based on Content-Type.
+  // Some providers always return SSE regardless of stream=false.
+  // When the upstream sends SSE, use the streaming handler; otherwise read as JSON
+  // and translate to a Responses-API response directly (the old non-streaming path).
+  const upstreamContentType = upstreamRes.headers.get("content-type") || "";
+  const isSseResponse = upstreamContentType.includes("text/event-stream");
+
+  log.info(`[proxy] upstream status=${upstreamRes.status} content-type=${upstreamContentType}`);
+
+  // When the client requested JSON (stream=false) but the upstream returned SSE,
+  // accumulate the SSE chunks and translate to a Responses-API JSON response.
+  if (isSseResponse && !isStream) {
+    let buffer = "";
+    const decoder = new TextDecoder();
+    const lines = [];
+    for await (const chunk of upstreamRes.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+    }
+    for (const line of buffer.split("\n")) {
+      if (line.startsWith("data: ") && line !== "data: [DONE]") {
+        try { lines.push(JSON.parse(line.slice(6))); } catch {}
+      }
+    }
+    const merged = mergeStreamedChunks(lines);
+    const responsesResponse = chatCompletionToResponse(merged, body.model, originalPreviousResponseId, body.metadata);
+    const nonStreamReasoning = merged.choices?.[0]?.message?.reasoning_content || "";
+    storeResponse(responsesResponse.id, {
+      provider,
+      input: originalInput,
+      output: responsesResponse.output,
+      previousResponseId: originalPreviousResponseId,
+      breakerFired: hardBreakerFired,
+      reasoningContent: nonStreamReasoning,
+    });
+    sendJson(res, 200, responsesResponse);
+    return;
+  }
+
+  if (isSseResponse) {
     const { responseId: streamRespId, output: streamOutput, reasoningContent: streamReasoning } = await handleStreamingResponse(
       req,
       upstreamRes,
@@ -1728,6 +1798,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     return;
   }
 
+  // Non-streaming JSON path
   const ccResponse = await upstreamRes.json();
   const responsesResponse = chatCompletionToResponse(ccResponse, body.model, originalPreviousResponseId, body.metadata);
   const nonStreamReasoning = ccResponse.choices?.[0]?.message?.reasoning_content || "";
@@ -1735,9 +1806,9 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     provider,
     input: originalInput,
     output: responsesResponse.output,
-    reasoningContent: nonStreamReasoning,
     previousResponseId: originalPreviousResponseId,
     breakerFired: hardBreakerFired,
+    reasoningContent: nonStreamReasoning,
   });
   sendJson(res, 200, responsesResponse);
 }
@@ -1767,6 +1838,14 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
   }
 
   const ccHasUrls = conversationHasUrls(validated);
+
+  // Remap model if not available on this upstream provider
+  const chatUpstreamModels = cfg.models || [];
+  if (!chatUpstreamModels.includes(body.model) && body.model && cfg.defaultModel) {
+    const oldModel = body.model;
+    body.model = cfg.defaultModel;
+    log.info(`[proxy] chat/completions remapped model ${oldModel} -> ${body.model} for provider ${provider}`);
+  }
 
   if (ccHasUrls) {
     body.tools = ensureWebFetchTool(body.tools);
@@ -1830,7 +1909,29 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
     return;
   }
 
-  if (isStream) {
+  // Some providers return SSE even when stream=false
+  const upstreamContentType = upstreamRes.headers.get("content-type") || "";
+  const isUpstreamStreaming = isStream || upstreamContentType.includes("text/event-stream");
+
+  if (isUpstreamStreaming) {
+    if (!isStream) {
+      // Accumulate SSE chunks into a standard JSON response
+      let buffer = "";
+      const decoder = new TextDecoder();
+      const lines = [];
+      for await (const chunk of upstreamRes.body) {
+        buffer += decoder.decode(chunk, { stream: true });
+      }
+      for (const line of buffer.split("\n")) {
+        if (line.startsWith("data: ") && line !== "data: [DONE]") {
+          try { lines.push(JSON.parse(line.slice(6))); } catch {}
+        }
+      }
+      const merged = mergeStreamedChunks(lines);
+      sendJson(res, 200, merged);
+      return;
+    }
+
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache",
@@ -1851,6 +1952,30 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
 
   const data = await upstreamRes.json();
   sendJson(res, 200, data);
+}
+
+/** Merge SSE streamed chat.completion.chunk objects into a single chat.completion response. */
+function mergeStreamedChunks(chunks) {
+  if (chunks.length === 0) return { choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }] };
+  let content = "";
+  let finishReason = "stop";
+  const last = chunks[chunks.length - 1];
+  const usage = last.usage || {};
+  for (const chunk of chunks) {
+    const delta = chunk.choices?.[0]?.delta;
+    if (delta?.content) content += delta.content;
+    const fr = chunk.choices?.[0]?.finish_reason;
+    if (fr) finishReason = fr;
+  }
+  const first = chunks.find(c => c.choices?.[0]?.delta?.role);
+  return {
+    id: last.id,
+    object: "chat.completion",
+    created: last.created,
+    model: last.model,
+    choices: [{ index: 0, message: { role: first?.choices?.[0]?.delta?.role || "assistant", content }, finish_reason: finishReason }],
+    usage,
+  };
 }
 
 // --- HTTP server ---
