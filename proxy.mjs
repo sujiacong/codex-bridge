@@ -1019,9 +1019,10 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
   const decoder = new TextDecoder();
 
   try {
-    for await (const chunk of upstreamRes.body) {
-      if (clientGone(res)) break;
-      buffer += decoder.decode(chunk, { stream: true });
+    try {
+      for await (const chunk of upstreamRes.body) {
+        if (clientGone(res)) break;
+        buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop();
 
@@ -1114,6 +1115,13 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
           completionSent = true;
           streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, finishReason, parsed.usage, previousResponseId, metadata);
         }
+      }
+    }
+    } catch (e) {
+      if (/ReadableStream is locked/i.test(e?.message) || /cancelled/i.test(e?.message)) {
+        log.debug(`[proxy] stream iterator aborted (${responseId}): ${e.message}`);
+      } else {
+        throw e;
       }
     }
   } finally {
@@ -1306,7 +1314,7 @@ function wireClientCancel(res, upstreamRes) {
   const onClose = () => {
     if (cancelled) return;
     cancelled = true;
-    try { upstreamRes.body.cancel?.(); } catch { /* ignore */ }
+    try { upstreamRes.body.cancel?.().catch(() => {}); } catch { /* ignore */ }
   };
   res.once("close", onClose);
   return () => {
@@ -1403,6 +1411,12 @@ async function pipeResponsesStreamAndCapture(req, upstreamRes, res, onCompleted)
     }
 
     if (buffer.trim()) handleBlock(buffer);
+  } catch (e) {
+    if (/ReadableStream is locked/i.test(e?.message) || /cancelled/i.test(e?.message)) {
+      log.debug(`[proxy] stream iterator aborted: ${e.message}`);
+    } else {
+      throw e;
+    }
   } finally {
     teardown();
   }
@@ -1503,6 +1517,12 @@ async function forwardOpenAIChatCompletions(req, body, res) {
       for await (const chunk of upstreamRes.body) {
         if (clientGone(res)) break;
         await writeWithBackpressure(res, chunk);
+      }
+    } catch (e) {
+      if (/ReadableStream is locked/i.test(e?.message) || /cancelled/i.test(e?.message)) {
+        log.debug(`[proxy] stream iterator aborted: ${e.message}`);
+      } else {
+        throw e;
       }
     } finally {
       teardown();
@@ -1695,33 +1715,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     `[proxy] ${routeLabel} | stream=${isStream} | messages=${chatReq.messages.length}${hasConversationUrls ? " | web_fetch_injected" : ""} | roles=[${chatReq.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`
   );
 
-  if (hasConversationUrls) {
-    const result = await runWebFetchLoop({
-      baseRequest: chatReq,
-      initialMessages: chatReq.messages,
-      upstreamUrl,
-      upstreamKey,
-      prefix: "",
-    });
-    if (!result.ok) {
-      await sendUpstreamError(result.errorRes, res);
-      return;
-    }
-    const responsesResponse = chatCompletionToResponse(result.response, body.model, originalPreviousResponseId, body.metadata);
-    storeResponse(responsesResponse.id, {
-      provider,
-      input: originalInput,
-      output: responsesResponse.output,
-      previousResponseId: originalPreviousResponseId,
-      breakerFired: hardBreakerFired,
-      reasoningContent: result.response?.choices?.[0]?.message?.reasoning_content || "",
-    });
-
-    if (isStream) await sendResponseAsStream(res, responsesResponse, req);
-    else sendJson(res, 200, responsesResponse);
-    return;
-  }
-
+  
   const body2 = JSON.stringify(chatReq);
   log.info(`[proxy] sending to ${upstreamUrl}: model=${chatReq.model} messages=${chatReq.messages.length} stream=${chatReq.stream}`);
   const upstreamRes = await fetchWithTimeout(upstreamUrl, {
@@ -1854,47 +1848,7 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
 
   log.info(`[proxy] chat/completions ${provider}(${body.model}) | stream=${isStream} | messages=${body.messages.length}${ccHasUrls ? " | web_fetch_injected" : ""} | roles=[${body.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
 
-  if (ccHasUrls) {
-    const result = await runWebFetchLoop({
-      baseRequest: body,
-      initialMessages: body.messages,
-      upstreamUrl: `${cfg.base}/chat/completions`,
-      upstreamKey: cfg.key,
-      prefix: "cc",
-    });
-    if (!result.ok) {
-      await sendUpstreamError(result.errorRes, res);
-      return;
-    }
-    const finalCcResponse = result.response;
-
-    if (isStream) {
-      res.writeHead(200, {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      });
-      const msg = finalCcResponse.choices?.[0]?.message;
-      if (msg?.tool_calls) {
-        for (let i = 0; i < msg.tool_calls.length; i++) {
-          const tc = msg.tool_calls[i];
-          res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] } }] })}\n\n`);
-          res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] } }] })}\n\n`);
-        }
-      }
-      if (msg?.content) {
-        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: msg.content } }] })}\n\n`);
-      }
-      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: finalCcResponse.choices[0].finish_reason }], usage: finalCcResponse.usage })}\n\n`);
-      res.write("data: [DONE]\n\n");
-      res.end();
-      return;
-    }
-
-    sendJson(res, 200, finalCcResponse);
-    return;
-  }
-
+  
   const upstreamRes = await fetchWithTimeout(`${cfg.base}/chat/completions`, {
     method: "POST",
     headers: {
@@ -1942,6 +1896,12 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
       for await (const chunk of upstreamRes.body) {
         if (clientGone(res)) break;
         await writeWithBackpressure(res, chunk);
+      }
+    } catch (e) {
+      if (/ReadableStream is locked/i.test(e?.message) || /cancelled/i.test(e?.message)) {
+        log.debug(`[proxy] stream iterator aborted: ${e.message}`);
+      } else {
+        throw e;
       }
     } finally {
       teardown();
